@@ -35,6 +35,26 @@ parser.add_argument('--log', type=str, default='log.txt',
                     help='log file name')
 parser.add_argument('--sensitivity', type=float, default=2,
                     help="sensitivity value that is multiplied to layer's std in order to get threshold value")
+parser.add_argument('--pruning-method', type=str, default='tfidf', choices=['std', 'tfidf'],
+                    help='method used for pruning (default: tfidf)')
+parser.add_argument('--tfidf-activation-threshold', type=float, default=0.05,
+                    help='activation threshold used when computing document frequency for TF-IDF pruning')
+parser.add_argument('--tfidf-idf-smooth', type=float, default=1.0,
+                    help='smoothing value added to the IDF numerator and denominator')
+parser.add_argument('--tfidf-idf-add', type=float, default=1.0,
+                    help='constant added to the IDF term before applying the power')
+parser.add_argument('--tfidf-idf-power', type=float, default=1.0,
+                    help='exponent applied to the IDF term during TF-IDF pruning')
+parser.add_argument('--tfidf-tf-power', type=float, default=1.0,
+                    help='exponent applied to the mean activation (TF) term during TF-IDF pruning')
+parser.add_argument('--tfidf-weight-power', type=float, default=1.0,
+                    help='exponent applied to weight magnitudes during TF-IDF pruning')
+parser.add_argument('--tfidf-global-threshold', action='store_true', default=False,
+                    help='if set, compute a single TF-IDF threshold across all prunable layers')
+parser.add_argument('--tfidf-percentile', type=float, default=None,
+                    help='optional percentile (0-100) for TF-IDF pruning; overrides sensitivity when set')
+parser.add_argument('--tfidf-max-batches', type=int, default=None,
+                    help='maximum number of batches to use when collecting TF-IDF activation statistics')
 args = parser.parse_args()
 
 # Control Seed
@@ -75,6 +95,76 @@ util.print_model_parameters(model)
 # NOTE : `weight_decay` term denotes L2 regularization loss term
 optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0001)
 initial_optimizer_state_dict = optimizer.state_dict()
+
+
+def collect_activation_statistics(model, data_loader, device, activation_threshold=0.05, max_batches=None):
+    """Collect mean absolute activations and document frequency per masked layer."""
+    activation_threshold = max(0.0, activation_threshold)
+    stats = {}
+
+    handles = []
+    for name, module in model.named_modules():
+        if hasattr(module, 'mask'):
+            def make_hook(layer_name):
+                def hook(_module, inputs, _output):
+                    if not inputs:
+                        return
+                    features = inputs[0]
+                    if features is None:
+                        return
+                    if features.dim() == 1:
+                        features = features.unsqueeze(0)
+                    batch_size = features.size(0)
+                    if batch_size == 0:
+                        return
+                    flattened = features.detach().reshape(batch_size, -1).abs().to(dtype=torch.double, device='cpu')
+                    present = (flattened > activation_threshold).to(dtype=torch.double)
+
+                    layer_stats = stats.setdefault(layer_name, {
+                        'sum_abs_activation': torch.zeros(flattened.size(1), dtype=torch.double),
+                        'doc_freq': torch.zeros(flattened.size(1), dtype=torch.double),
+                        'sample_count': 0,
+                    })
+                    layer_stats['sum_abs_activation'] += flattened.sum(dim=0)
+                    layer_stats['doc_freq'] += present.sum(dim=0)
+                    layer_stats['sample_count'] += batch_size
+
+                return hook
+
+            handles.append(module.register_forward_hook(make_hook(name)))
+
+    if not handles:
+        print('No masked layers found when collecting activation statistics.')
+        return {}
+
+    was_training = model.training
+    model.eval()
+    processed_samples = 0
+    with torch.no_grad():
+        for batch_idx, (data, _target) in enumerate(data_loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+            data = data.to(device)
+            processed_samples += data.size(0)
+            model(data)
+
+    for handle in handles:
+        handle.remove()
+
+    if was_training:
+        model.train()
+
+    for layer_name, layer_stats in stats.items():
+        count = layer_stats['sample_count']
+        if count > 0:
+            layer_stats['mean_abs_activation'] = layer_stats['sum_abs_activation'] / count
+        else:
+            layer_stats['mean_abs_activation'] = torch.zeros_like(layer_stats['sum_abs_activation'])
+        layer_stats['doc_freq'] = layer_stats['doc_freq'].clamp_(min=0.0, max=float(count))
+        del layer_stats['sum_abs_activation']
+
+    print(f'Collected activation statistics from {processed_samples} samples for TF-IDF pruning.')
+    return stats
 
 def train(epochs):
     model.train()
@@ -131,7 +221,28 @@ print("--- Before pruning ---")
 util.print_nonzeros(model)
 
 # Pruning
-model.prune_by_std(args.sensitivity)
+if args.pruning_method == 'tfidf':
+    print('--- Collecting statistics for TF-IDF pruning ---')
+    activation_stats = collect_activation_statistics(
+        model,
+        train_loader,
+        device,
+        activation_threshold=args.tfidf_activation_threshold,
+        max_batches=args.tfidf_max_batches,
+    )
+    model.prune_by_tfidf(
+        activation_stats,
+        sensitivity=args.sensitivity,
+        percentile=args.tfidf_percentile,
+        global_threshold=args.tfidf_global_threshold,
+        idf_smooth=args.tfidf_idf_smooth,
+        idf_add=args.tfidf_idf_add,
+        idf_power=args.tfidf_idf_power,
+        tf_power=args.tfidf_tf_power,
+        weight_power=args.tfidf_weight_power,
+    )
+else:
+    model.prune_by_std(args.sensitivity)
 accuracy = test()
 util.log(args.log, f"accuracy_after_pruning {accuracy}")
 print("--- After pruning ---")
